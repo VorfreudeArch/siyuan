@@ -1,0 +1,141 @@
+name: Build Android APK (Unlocked)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build_android:
+    runs-on: ubuntu-24.04
+    name: Build Android Unlocked APK
+    env:
+      GOPATH: ${{ github.workspace }}/go
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        run: npm install --global pnpm@12.6.0
+
+      - name: Install Node Dependencies & Build UI
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm run build
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android NDK
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;28.2.13676358" > /dev/null
+          NDK_DIR="$ANDROID_HOME/ndk/28.2.13676358"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
+
+      - name: Set up gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@2553ed8ce294
+          echo "$GOPATH/bin" >> $GITHUB_PATH
+          "$GOPATH/bin/gomobile" init
+
+      - name: Building Android Kernel
+        run: gomobile bind -tags "fts5 sqlcipher" -ldflags "-s -w" -v -o kernel.aar -target android/arm64,android/arm -androidapi 26 ./mobile/
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+        env:
+          CGO_ENABLED: 1
+          JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8
+
+      - name: Checkout siyuan-android
+        uses: actions/checkout@v4
+        with:
+          repository: siyuan-note/siyuan-android
+          ref: main
+          path: ${{ github.workspace }}/siyuan-android
+
+      - name: Patch siyuan-android Repositories
+        run: |
+          sed -i '/maven.aliyun.com/d' build.gradle
+        working-directory: ${{ github.workspace }}/siyuan-android
+
+      - name: Prepare siyuan-android Build Inputs
+        run: |
+          mkdir -p ${{ github.workspace }}/siyuan-android/app/libs
+          cp ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/kernel.aar \
+             ${{ github.workspace }}/siyuan-android/app/libs/kernel.aar
+          cd ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+          node scripts/trimChangelogs.js
+          python3 ../scripts/prepare-ocr.py
+          zip -r app.zip appearance guide stage $([ -d changelogs ] && echo changelogs) -x 'stage/ocr/runtime/*'
+          zip -j app.zip ../LICENSE ../THIRD_PARTY_NOTICES.md
+          mkdir -p ${{ github.workspace }}/siyuan-android/app/src/main/assets
+          cp app.zip ${{ github.workspace }}/siyuan-android/app/src/main/assets/app.zip
+
+      - name: Generate Self-Signed Keystore
+        run: |
+          keytool -genkey -v -keystore ${{ github.workspace }}/siyuan-android/app/siyuan-android.jks \
+            -alias siyuanConfig -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass siyuan123 -keypass siyuan123 \
+            -dname "CN=SiYuan, OU=Community, O=Vorfreude, L=Catania, ST=Italy, C=IT"
+          cat > ${{ github.workspace }}/siyuan-android/signings.gradle <<EOF
+          android {
+            signingConfigs {
+              siyuanConfig {
+                storeFile file("siyuan-android.jks")
+                storePassword "siyuan123"
+                keyAlias "siyuanConfig"
+                keyPassword "siyuan123"
+              }
+            }
+          }
+          EOF
+
+      - name: Building Android App
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x ./gradlew
+          ./gradlew assembleOfficialRelease
+        working-directory: ${{ github.workspace }}/siyuan-android
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: siyuan-android-unlocked
+          path: ${{ github.workspace }}/siyuan-android/app/build/outputs/apk/official/release/*.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: always()
+        with:
+          tag_name: v3.8.10-unlocked
+          name: SiYuan v3.8.10 Unlocked (Android APK)
+          body: |
+            Release automatica di SiYuan con sincronizzazione S3/WebDAV di terze parti sbloccata.
+            - Include supporto WebDAV verso Nextcloud locale e remoto
+            - Nessuna richiesta di login/abbonamento a pagamento per WebDAV e S3
+          files: ${{ github.workspace }}/siyuan-android/app/build/outputs/apk/official/release/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
